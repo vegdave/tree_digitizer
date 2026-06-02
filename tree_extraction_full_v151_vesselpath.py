@@ -389,11 +389,6 @@ def branch_extraction_pipeline(gray, tip):
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     show_image("Blurred Grayscale", gray)
     
-    """gray = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(13, 13)).apply(gray)
-    
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
-    show_image("Blurred Grayscale", gray)"""
-    
     # Sato vesselness filter
     # Dark ridges (black_ridges=True)
     # Tuning: if thin tips are missed, lower the sigma minimum 
