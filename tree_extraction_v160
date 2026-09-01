@@ -3,20 +3,40 @@ import numpy as np
 import networkx as nx
 import glob
 import os
+import csv
+import math
+import traceback
 from skimage.morphology import skeletonize
 from skimage.filters import sato
-from scipy.ndimage import convolve, percentile_filter
-from matplotlib import pyplot as plt
+from scipy.ndimage import convolve
+
+# config
+ENABLE_SHOW_IMAGES = False   # True = blocking window at every step (single-image debugging only)
+ENABLE_DEBUG_SAVE  = False   # True = dump intermediate stages to debug_outputs/
+PX_PER_MM          = 1863.0  # calibration: 1863 px = 1 mm
+
+IN_DIR  = os.path.join('data', 'batches', 'Batch 2', 'DC-', '15 days', 'S3', 'images')
+OUT_DIR = os.path.join(IN_DIR, 'extracted')
+CSV_PATH = os.path.join(OUT_DIR, 'branch_lengths.csv')
+
+IMG_EXTS = ('*.jpg', '*.jpeg', '*.png', '*.tif', '*.tiff', '*.bmp')
+
+CURRENT_IMAGE = 'unset'
 
 # Function to display an image in a window with a wait for a key press
 def show_image(title, image, save_debug=False, tip=None):  
+    if not (ENABLE_SHOW_IMAGES or (save_debug and ENABLE_DEBUG_SAVE)):
+        return
+
     # Convert grayscale to BGR for visualization if needed
     if len(image.shape) == 2:
         image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-        
+    else:
+        image = image.copy()   # never draw on the caller's array
+
     if tip is not None:
         # Draw a red circle at the tip location for visualization
-        cv2.circle(image, tip, 6, (0, 0, 255), 2, cv2.LINE_AA)
+        cv2.circle(image, tuple(int(v) for v in tip), 6, (0, 0, 255), 2, cv2.LINE_AA)
 
     if ENABLE_SHOW_IMAGES:    
         cv2.namedWindow(title, cv2.WINDOW_KEEPRATIO)
@@ -26,14 +46,16 @@ def show_image(title, image, save_debug=False, tip=None):
         cv2.waitKey(0)
         cv2.destroyAllWindows()
     
-    # Get file version for debugging
-    folder_name_version = os.path.basename(__file__).split("v")[1].split("_")[0]
-    
+    # Get file version for debugging (fall back to the whole stem if the name isn't v<num>_)
+    stem = os.path.splitext(os.path.basename(__file__))[0]
+    parts = [p for p in stem.split('_') if p.startswith('v') and p[1:].isdigit()]
+    folder_name_version = parts[-1][1:] if parts else stem
+
     # Add current just the python file name to the saved image title for easier debugging and review of results
-    title = CURRENT_IMAGE + title
-       
+    title = CURRENT_IMAGE + "_" + title
+
     # Save the image to disk for later review
-    if save_debug:
+    if save_debug and ENABLE_DEBUG_SAVE:
         print(f"Saving debug image: {title}")
         save_path = os.path.join('debug_outputs/' + folder_name_version, f"{title.replace(' ', '_')}.jpg")
         os.makedirs('debug_outputs/' + folder_name_version, exist_ok=True)
@@ -242,10 +264,19 @@ def needle_tip_detection_pipeline(gray, s_r=0.5):
 
 # Adjust the tip of the needle to the skeleton
 def snap_to_skeleton(skeleton, tip, radius=20):
-    skel_patch = skeleton[tip[1]-radius:tip[1]+radius+1, tip[0]-radius:tip[0]+radius+1]
-    
+    h, w = skeleton.shape
+    y0 = max(0, tip[1] - radius)
+    x0 = max(0, tip[0] - radius)
+    y1 = min(h, tip[1] + radius + 1)
+    x1 = min(w, tip[0] + radius + 1)
+
+    skel_patch = skeleton[y0:y1, x0:x1]
+    if skel_patch.size == 0:
+        print("Snap patch empty (tip outside image?); returning original tip.")
+        return tip
+
     _, labels, stats, _ = cv2.connectedComponentsWithStats(
-    skel_patch.astype(np.uint8), connectivity=8
+    (skel_patch > 0).astype(np.uint8), connectivity=8
     )       
 
     areas = stats[1:, cv2.CC_STAT_AREA]
@@ -260,15 +291,15 @@ def snap_to_skeleton(skeleton, tip, radius=20):
     ys, xs = np.where(mask)
 
     # convert to global coords
-    xs_global = xs + (tip[0] - radius)
-    ys_global = ys + (tip[1] - radius)
+    xs_global = xs + x0
+    ys_global = ys + y0
 
     # Find the skeleton pixel closest to the original tip
     dists_sqr = (xs_global - tip[0])**2 + (ys_global - tip[1])**2
     idx = np.argmin(dists_sqr)
 
-    start = (xs_global[idx], ys_global[idx])
-    
+    start = (int(xs_global[idx]), int(ys_global[idx]))
+
     return start
 
 
@@ -349,27 +380,15 @@ def find_longest_path_from_tip(skeleton, tip):
     tip_component = nx.node_connected_component(G, tip_node)
     G = G.subgraph(tip_component).copy()
 
-    # Single BFS from tip
-    dist = {tip_node: 0.0}
-    pred = {tip_node: None}
-    queue = [tip_node]
-    farthest = tip_node
+    # Weighted geodesic distance from tip to every reachable skeleton pixel.
+    # Dijkstra, not BFS: BFS minimises hop count, which is not the same as
+    # minimising the 1.0/1.414 edge weights and gives an order-dependent answer.
+    dist = nx.single_source_dijkstra_path_length(G, tip_node, weight='weight')
+    farthest = max(dist, key=dist.get)
+    path = nx.dijkstra_path(G, tip_node, farthest, weight='weight')
 
-    for node in queue:
-        for nb in G.neighbors(node):
-            if nb not in dist:
-                dist[nb] = dist[node] + G[node][nb]['weight']
-                pred[nb] = node
-                queue.append(nb)
-                if dist[nb] > dist[farthest]:
-                    farthest = nb
-
-    # Trace path back from farthest node to tip
-    path = []
-    cur = farthest
-    while cur is not None:
-        path.append(cur)
-        cur = pred[cur]
+    path_length = dist[farthest]                       # geodesic length in px
+    n_pixels = len(path)                               # pixel count, for reference
 
     # Build path mask
     h, w = skel.shape
@@ -378,10 +397,11 @@ def find_longest_path_from_tip(skeleton, tip):
         if 0 <= r < h and 0 <= c < w:
             path_mask[r, c] = 255
 
-    path_length = len(path)
-    print(f"Longest path from tip: {path_length} pixels | far_end=({farthest[1]}, {farthest[0]})")
+    far_xy = (int(farthest[1]), int(farthest[0]))      # back to (x, y)
+    print(f"Longest path from tip: {path_length:.1f} px geodesic "
+          f"({n_pixels} pixels) | far_end={far_xy}")
 
-    return path_mask, path_length
+    return path_mask, path_length, far_xy
 
 
 # Run the full tree extraction pipeline after finding the needle tip
@@ -440,109 +460,143 @@ def branch_extraction_pipeline(gray, tip):
       
     show_image("Extracted Branches Overlay", overlay, tip=adjusted_tip, save_debug=True)
 
-    # Crop to left of tip, exclude the needle body
+    # Crop to left of tip, exclude the needle body.
+    # +1 so the tip pixel itself survives, otherwise the BFS seed is deleted
+    # and the code silently falls back to "nearest surviving node".
     main_tree_left = main_tree.copy()
-    main_tree_left[:, adjusted_tip[0]:] = 0
+    main_tree_left[:, adjusted_tip[0] + 1:] = 0
 
     # Find longest path from tip
-    path_mask, path_length = find_longest_path_from_tip(main_tree_left, adjusted_tip)
+    path_mask, path_length, far_xy = find_longest_path_from_tip(main_tree_left, adjusted_tip)
     path_mask_thick = cv2.dilate(path_mask, kernel, iterations=1)
+
+    # Straight-line tip-to-far-end distance, as a sanity check against the geodesic
+    euclid = math.hypot(far_xy[0] - adjusted_tip[0], far_xy[1] - adjusted_tip[1])
 
     # Build final overlay: skeleton in green, longest path in blue, tip marked
     skeleton_dilated = cv2.dilate(main_tree_left, kernel, iterations=1)
     final_overlay = overlay_skeleton_on_gray(clahe_overlay, skeleton_dilated)
     final_overlay = overlay_skeleton_on_gray(final_overlay, path_mask_thick, color=(255, 100, 0))
-    show_image("Longest Path Overlay", final_overlay, tip=adjusted_tip, save_debug=True)
+    cv2.circle(final_overlay, adjusted_tip, 6, (0, 0, 255), 2, cv2.LINE_AA)
+    cv2.circle(final_overlay, far_xy, 6, (0, 255, 255), 2, cv2.LINE_AA)
+    show_image("Longest Path Overlay", final_overlay, save_debug=True)
 
-    print(f"[{CURRENT_IMAGE}] longest path: {path_length} px")
-     
-    """skeleton_connected = bridge_endpoints_via_dilation(skeleton, max_bridge_dist=10)
-    skeleton_connected = cv2.dilate(skeleton_connected, kernel, iterations=1)
+    print(f"[{CURRENT_IMAGE}] longest path: {path_length:.1f} px "
+          f"= {path_length / PX_PER_MM:.4f} mm")
 
-    overlay = overlay_skeleton_on_gray(gray, skeleton_connected)
-    show_image("Skeleton Connected Overlay", overlay)"""
-    
-    return skeleton
-
-
-# Average a list of images using OpenCV's accumulate function to reduce noise and enhance common features across multiple samples
-def average_images_cv(image_list):
-    acc = np.zeros_like(image_list[0], dtype=np.float32)
-
-    for img in image_list:
-        cv2.accumulate(img, acc)
-
-    avg = acc / len(image_list)
-    return cv2.convertScaleAbs(avg)
+    return {
+        'tip_x': int(adjusted_tip[0]),
+        'tip_y': int(adjusted_tip[1]),
+        'far_x': far_xy[0],
+        'far_y': far_xy[1],
+        'length_px': float(path_length),
+        'length_mm': float(path_length) / PX_PER_MM,
+        'euclid_px': float(euclid),
+        'euclid_mm': float(euclid) / PX_PER_MM,
+        'final_overlay': final_overlay,
+    }
 
 
-# Median stacking if averaging is producing ghosts (non stationary camera). More memory and compute intensive but can be more robust to outliers and misalignments.
-def median_images(image_list):
-    stack = np.stack(image_list, axis=0)
-    median = np.median(stack, axis=0)
-    return median.astype(np.uint8)
+# ------------------------------------------------------------ batch run ----
+def list_images(folder):
+    paths = []
+    for ext in IMG_EXTS:
+        paths.extend(glob.glob(os.path.join(folder, ext)))
+    # Case-insensitive filesystems (Windows) can return the same file twice
+    seen, unique = set(), []
+    for p in sorted(paths):
+        key = os.path.normcase(os.path.abspath(p))
+        if key not in seen:
+            seen.add(key)
+            unique.append(p)
+    return unique
 
 
-def subtract_background(image, background):
-    # Ensure both images are the same size
-    if image.shape != background.shape:
-        raise ValueError("Image and background must be the same size.")
-    
-    # Subtract background and clip to valid range
-    subtracted = cv2.absdiff(image, background)
-    return subtracted
+def process_one(path):
+    """Run the full pipeline on a single image. Returns the result dict."""
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
+    if img is None:
+        raise IOError(f"cv2.imread returned None for {path}")
 
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-ENABLE_SHOW_IMAGES = True  # Set to False to skip showing images
-BDG_SUB = False  # Set to True to enable background subtraction - MUST HAVE THE INITIAL BACKGROUND IMAGE AS THE FIRST IMAGE IN THE FOLDER
-
-if ENABLE_SHOW_IMAGES:
-    print("Image display is ENABLED. Press any key on the image window to continue through each step.")
-else:  
-    print("Image display is DISABLED. Set ENABLE_SHOW_IMAGES=True to enable runtime visualisation.")
-
-if BDG_SUB:
-    # The first image in the folder should be the empty background with just the needle. Second image is the tree
-    folder = 'data/full_sets/S3_final_tree_extract_w_BGDsub'
-    image_paths = glob.glob(os.path.join(folder, '*.jpg'))
-    CURRENT_IMAGE = os.path.splitext(os.path.basename(image_paths[1]))[0]
-    
-    background = cv2.imread(image_paths[0])
-    background = cv2.cvtColor(background, cv2.COLOR_BGR2GRAY)
-    
-    gray = cv2.cvtColor(cv2.imread(image_paths[1]), cv2.COLOR_BGR2GRAY)
-    combined = subtract_background(gray, background)
-    show_image("Background Subtracted Image", combined)
- 
-    # Normalise to stretch the full dynamic range of the subtracted signal
-    combined = cv2.normalize(combined, None, 0, 255, cv2.NORM_MINMAX)
-    show_image("Combined Normalized", combined)
-    
-    # TODO see if this top-hat is needed
-    tophat_ksize = 31
-    tophat_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (tophat_ksize, tophat_ksize)
-    )
-    combined = cv2.morphologyEx(combined, cv2.MORPH_TOPHAT, tophat_kernel)
-    show_image("Background Top-Hat", combined)
- 
-    # Invert so branches are dark ridges (required by Sato black_ridges=True)
-    combined = cv2.bitwise_not(combined)
-    show_image("Combined Normalized and Inverted", combined)
- 
     tip = needle_tip_detection_pipeline(gray, s_r=0.5)
- 
-    branch_extraction_pipeline(combined, tip)
-else:
-    # Single image processing without background subtraction
-    folder = 'data/final_tree_samples'
-    image_paths = glob.glob(os.path.join(folder, '*.jpg'))
-    for path in image_paths:
-        img = cv2.imread(path)    
+    result = branch_extraction_pipeline(gray, tip)
+    result['height'], result['width'] = gray.shape
+    return result
+
+
+def main():
+    if not os.path.isdir(IN_DIR):
+        raise SystemExit(f"Input folder not found: {os.path.abspath(IN_DIR)}")
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+    image_paths = list_images(IN_DIR)
+    if not image_paths:
+        raise SystemExit(f"No images matching {IMG_EXTS} in {os.path.abspath(IN_DIR)}")
+
+    print(f"Found {len(image_paths)} image(s) in {IN_DIR}")
+    print(f"Writing overlays to {OUT_DIR}")
+    print(f"Calibration: {PX_PER_MM} px = 1 mm  ({1000.0 / PX_PER_MM:.4f} um/px)\n")
+
+    rows = []
+    for i, path in enumerate(image_paths, 1):
+        global CURRENT_IMAGE
         CURRENT_IMAGE = os.path.splitext(os.path.basename(path))[0]
-        
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        print(f"[{i}/{len(image_paths)}] {CURRENT_IMAGE}")
 
-        tip = needle_tip_detection_pipeline(gray, s_r=0.5)
+        row = {
+            'filename': os.path.basename(path),
+            'length_px': '', 'length_mm': '',
+            'euclid_px': '', 'euclid_mm': '',
+            'tip_x': '', 'tip_y': '', 'far_x': '', 'far_y': '',
+            'status': 'ok', 'error': '',
+        }
 
-        skeleton = branch_extraction_pipeline(gray, tip)
+        try:
+            res = process_one(path)
+
+            out_path = os.path.join(OUT_DIR, f"{CURRENT_IMAGE}_final_overlay.png")
+            if not cv2.imwrite(out_path, res['final_overlay']):
+                raise IOError(f"cv2.imwrite failed for {out_path}")
+
+            for k in ('tip_x', 'tip_y', 'far_x', 'far_y'):
+                row[k] = res[k]
+            row['length_px'] = round(res['length_px'], 2)
+            row['length_mm'] = round(res['length_mm'], 5)
+            row['euclid_px'] = round(res['euclid_px'], 2)
+            row['euclid_mm'] = round(res['euclid_mm'], 5)
+
+        except Exception as exc:
+            # Avoid crashing the whole batch run; log the error and continue with the next image
+            row['status'] = 'failed'
+            row['error'] = f"{type(exc).__name__}: {exc}"
+            print(f"  FAILED: {row['error']}")
+            traceback.print_exc()
+
+        rows.append(row)
+        print()
+
+    fields = ['filename', 'length_px', 'length_mm', 'euclid_px', 'euclid_mm',
+              'tip_x', 'tip_y', 'far_x', 'far_y', 'status', 'error']
+    with open(CSV_PATH, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    n_ok = sum(r['status'] == 'ok' for r in rows)
+    print(f"Done. {n_ok}/{len(rows)} succeeded. CSV -> {CSV_PATH}")
+
+    if n_ok:
+        lengths = [r['length_mm'] for r in rows if r['status'] == 'ok']
+        print(f"Longest branch: min {min(lengths):.4f} mm | "
+              f"median {sorted(lengths)[len(lengths) // 2]:.4f} mm | "
+              f"max {max(lengths):.4f} mm")
+
+
+if __name__ == '__main__':
+    if ENABLE_SHOW_IMAGES:
+        print("Image display is ENABLED - the run will block on every step. "
+              "Set ENABLE_SHOW_IMAGES=False for a batch run.\n")
+    main()

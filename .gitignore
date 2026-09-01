@@ -4,6 +4,7 @@
 *.jpeg
 debug_outputs/
 denosing_examine/
+data/
 
 # VS Code
 .vscode/
