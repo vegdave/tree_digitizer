@@ -23,20 +23,29 @@ ENABLE_SHOW_IMAGES = False   # True = blocking window at every step (single-imag
 ENABLE_DEBUG_SAVE  = False   # True = dump intermediate stages to debug_outputs/
 PX_PER_MM          = 1863.0  # calibration: 1863 px = 1 mm
 
-IN_DIR  = os.path.join('data', 'batches', 'Batch 2', 'DC-', '30 days', 'S1', 'images')
-OUT_DIR = os.path.join(IN_DIR, 'extracted_optimised')
+# Use environment variables to allow external wrapper scripts to override the input/output directories without modifying this script.
+IN_DIR  = os.environ.get('TREE_IN_DIR',  os.path.join('data', 'batches', 'Batch 2', 'DC-', '15 days', 'S2', 'images'))
+OUT_DIR = os.environ.get('TREE_OUT_DIR', os.path.join(IN_DIR, 'extracted_v162'))
+
 CSV_PATH = os.path.join(OUT_DIR, 'branch_lengths.csv')
 
 IMG_EXTS = ('*.jpg', '*.jpeg', '*.png', '*.tif', '*.tiff', '*.bmp')
 
 CURRENT_IMAGE = 'unset'
 
-# Sato scales. 1.05 instead of 1.0 because scipy's gaussian filter falls off a
-# fast path at sigma exactly 1.0 (14.2 s vs 1.7 s on a 4000x3000 frame) for no
-# meaningful change in response
+OVERLAY_SCALE = 0.5  # for saving the final overlay, 1.0 = full size, <1.0 = downsampled
+
+# Sato scales. 1.05 instead of 1.0 because scipy's gaussian filter is slow at exactly 1.0, and the difference in response is negligible
 SIGMAS = [0.5, 1.05, 1.5, 2, 3, 4, 5, 6]
 
 N_WORKERS = 8  # tune to the CPU
+
+# Minimum component size in pixels to keep after thresholding and opening. The tree is thousands of px, the speckle is tens.
+# This is currently not needed but kept in for additional noise reduction and potentially enables branch bridging if necessary
+MIN_COMPONENT_PX = 200
+
+# If the skeleton component connected to the tip is less than this fraction of the total skeleton pixels, it is considered suspect and a re-snap to the largest component is attempted.
+SUSPECT_FRAC = 0.5
 
 # Function to display an image in a window with a wait for a key press
 def show_image(title, image, save_debug=False, tip=None):  
@@ -278,7 +287,7 @@ def needle_tip_detection_pipeline(gray, s_r=0.5):
     
 
 # Adjust the tip of the needle to the skeleton
-def snap_to_skeleton(skeleton, tip, radius=20):
+def snap_to_skeleton(skeleton, tip, radius=20, prefer_global_largest=False):
     h, w = skeleton.shape
     y0 = max(0, tip[1] - radius)
     x0 = max(0, tip[0] - radius)
@@ -289,6 +298,22 @@ def snap_to_skeleton(skeleton, tip, radius=20):
     if skel_patch.size == 0:
         print("Snap patch empty (tip outside image?); returning original tip.")
         return tip
+
+    # Guard path: ignore the patch, snap to the nearest pixel of the biggest
+    # component in the whole image. Used when the patch-local choice stranded
+    # the seed on needle debris.
+    if prefer_global_largest:
+        _, g_labels, g_stats, _ = cv2.connectedComponentsWithStats(
+            (skeleton > 0).astype(np.uint8), connectivity=8)
+        g_areas = g_stats[1:, cv2.CC_STAT_AREA]
+        if g_areas.size == 0:
+            print("No skeleton components in image; returning original tip.")
+            return tip
+        g_mask = (g_labels == 1 + int(np.argmax(g_areas)))
+        g_ys, g_xs = np.where(g_mask)
+        g_d = (g_xs - tip[0])**2 + (g_ys - tip[1])**2
+        g_i = int(np.argmin(g_d))
+        return (int(g_xs[g_i]), int(g_ys[g_i]))
 
     _, labels, stats, _ = cv2.connectedComponentsWithStats(
     (skel_patch > 0).astype(np.uint8), connectivity=8
@@ -360,7 +385,7 @@ def hysteresis_thresholding(image, low_thresh, high_thresh):
     return thresh
 
 
-# Find the longest path with BFS from the tip to any endpoint in the skeleton using BFS
+# Find the longest path with Dijkstra's algorithm from the tip to the farthest reachable skeleton pixel
 def find_longest_path_from_tip(skeleton, tip):
     skel = (skeleton > 0).astype(np.uint8)
     rows, cols = np.where(skel)
@@ -386,7 +411,8 @@ def find_longest_path_from_tip(skeleton, tip):
 
     # Convert tip (x, y) → (row, col)
     tip_node = (tip[1], tip[0])
-    if tip_node not in G:
+    fallback = tip_node not in G
+    if fallback:
         nodes_arr = np.array(list(G.nodes()))
         dists = np.linalg.norm(nodes_arr - np.array(tip_node), axis=1)
         tip_node = tuple(nodes_arr[np.argmin(dists)])
@@ -395,9 +421,7 @@ def find_longest_path_from_tip(skeleton, tip):
     tip_component = nx.node_connected_component(G, tip_node)
     G = G.subgraph(tip_component).copy()
 
-    # Weighted geodesic distance from tip to every reachable skeleton pixel.
-    # Dijkstra, not BFS: BFS minimises hop count, which is not the same as
-    # minimising the 1.0/1.414 edge weights and gives an order-dependent answer.
+    # Using Dijkstra's algorithm to find the farthest pixel and the path to it.
     dist = nx.single_source_dijkstra_path_length(G, tip_node, weight='weight')
     farthest = max(dist, key=dist.get)
     path = nx.dijkstra_path(G, tip_node, farthest, weight='weight')
@@ -448,7 +472,18 @@ def branch_extraction_pipeline(gray, tip):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
     show_image("Opened Threshold", thresh)
-  
+
+    # Size filter. Remove small components that are likely noise.
+    # Careful with small reees and min component px selection
+    """t_sf = time.perf_counter()
+    n_comp, labels, stats, _ = cv2.connectedComponentsWithStats(thresh, connectivity=8)
+    keep = stats[:, cv2.CC_STAT_AREA] >= MIN_COMPONENT_PX
+    keep[0] = False                       # label 0 is background
+    thresh = (keep[labels] * 255).astype(np.uint8)
+    print(f"    size filter: {time.perf_counter() - t_sf:.2f}s | "
+          f"{n_comp-1} comps -> {int(keep.sum())} kept (>= {MIN_COMPONENT_PX} px)")
+    show_image("Size Filtered Threshold", thresh, save_debug=True)"""
+    
     # Skeletonize to get 1-pixel wide representation of the tree
     skeleton = skeletonize(thresh/255).astype(np.uint8)
 
@@ -466,21 +501,45 @@ def branch_extraction_pipeline(gray, tip):
     #overlay = overlay_skeleton_on_gray(gray, cv2.dilate(skeleton_connected, kernel, iterations=1))
     #show_image("Bridged Skeleton Overlay", overlay)
     
-    adjusted_tip = snap_to_skeleton(skeleton, tip, radius=20)
-    
-    show_image("Adjusted Tip on Skeleton", overlay, tip=adjusted_tip)
-    
-    # Keep only the skeleton pixels connected to the tip
-    main_tree = connected_skeleton_component(skeleton, adjusted_tip)
-    overlay = overlay_skeleton_on_gray(clahe_overlay, cv2.dilate(main_tree, kernel, iterations=1))
-      
-    show_image("Extracted Branches Overlay", overlay, tip=adjusted_tip, save_debug=True)
+    # Crop BEFORE snapping the tip to avoid accidentaly cutting the tree 
+    skeleton_left = skeleton.copy()
+    skeleton_left[:, tip[0] + 1:] = 0
 
-    # Crop to left of tip, exclude the needle body.
-    # +1 so the tip pixel itself survives, otherwise the BFS seed is deleted
-    # and the code silently falls back to "nearest surviving node".
-    main_tree_left = main_tree.copy()
-    main_tree_left[:, adjusted_tip[0] + 1:] = 0
+    adjusted_tip = snap_to_skeleton(skeleton_left, tip, radius=20)
+
+    show_image("Adjusted Tip on Skeleton", overlay, tip=adjusted_tip)
+
+    # Keep only the skeleton pixels connected to the tip
+    main_tree_left = connected_skeleton_component(skeleton_left, adjusted_tip)
+
+    # Guard against incorect tip placement: if the tip component is too small, re-snap to the largest component in the patch
+    suspect = False
+    comp_px = int((main_tree_left > 0).sum())
+
+
+    _, _, l_stats, _ = cv2.connectedComponentsWithStats(
+        (skeleton_left > 0).astype(np.uint8), connectivity=8)
+    l_areas = l_stats[1:, cv2.CC_STAT_AREA]
+    total_px = int(l_areas.max()) if l_areas.size else 0
+
+    if total_px > 0 and comp_px < SUSPECT_FRAC * total_px:
+        print(f"    [{CURRENT_IMAGE}] tip component {comp_px}/{total_px} px "
+              f"- re-snapping to largest component")
+        retry_tip = snap_to_skeleton(skeleton_left, tip, radius=20,
+                                     prefer_global_largest=True)
+        retry_tree = connected_skeleton_component(skeleton_left, retry_tip)
+        retry_px = int((retry_tree > 0).sum())
+
+        if retry_px > comp_px:
+            adjusted_tip, main_tree_left, comp_px = retry_tip, retry_tree, retry_px
+            print(f"    [{CURRENT_IMAGE}] re-snap recovered {retry_px} px")
+        else:
+            suspect = True
+            print(f"    [{CURRENT_IMAGE}] re-snap did not help; marking suspect")
+
+    show_image("Extracted Branches Overlay",
+               overlay_skeleton_on_gray(clahe_overlay, cv2.dilate(main_tree_left, kernel, iterations=1)),
+               tip=adjusted_tip, save_debug=True)
 
     # Find longest path from tip
     path_mask, path_length, far_xy = find_longest_path_from_tip(main_tree_left, adjusted_tip)
@@ -510,10 +569,12 @@ def branch_extraction_pipeline(gray, tip):
         'euclid_px': float(euclid),
         'euclid_mm': float(euclid) / PX_PER_MM,
         'final_overlay': final_overlay,
+        'comp_px': comp_px,
+        'total_px': total_px,
+        'suspect': suspect,
     }
 
-
-# ------------------------------------------------------------ batch run ----
+ 
 def list_images(folder):
     paths = []
     for ext in IMG_EXTS:
@@ -567,8 +628,13 @@ def process_image_worker(path):
     try:
         res = process_one(path)
 
-        out_path = os.path.join(OUT_DIR, f"{CURRENT_IMAGE}_final_overlay.png")
-        if not cv2.imwrite(out_path, res['final_overlay']):
+        overlay = res['final_overlay']
+        if OVERLAY_SCALE != 1.0:
+            overlay = cv2.resize(overlay, None, fx=OVERLAY_SCALE, fy=OVERLAY_SCALE,
+                                 interpolation=cv2.INTER_AREA)
+
+        out_path = os.path.join(OUT_DIR, f"{CURRENT_IMAGE}_final_overlay.jpg")
+        if not cv2.imwrite(out_path, overlay, [cv2.IMWRITE_JPEG_QUALITY, 85]):
             raise IOError(f"cv2.imwrite failed for {out_path}")
 
         for k in ('tip_x', 'tip_y', 'far_x', 'far_y'):
@@ -584,6 +650,9 @@ def process_image_worker(path):
         row['traceback'] = traceback.format_exc()
 
     row['secs'] = round(time.perf_counter() - t0, 2)
+
+    if res['suspect']:
+        row['status'] = 'suspect'
     return row
 
 
@@ -616,7 +685,12 @@ def main():
             rows.append(row)
             elapsed = time.perf_counter() - batch_t0
             eta = (elapsed / done) * (len(image_paths) - done)
-            flag = '' if row['status'] == 'ok' else '  FAILED: ' + row['error']
+            if row['status'] == 'ok':
+                flag = ''
+            elif row['status'] == 'failed':
+                flag = '  FAILED: ' + row['error']
+            else:
+                flag = f"  [{row['status']}]"
             print(f"[{done}/{len(image_paths)}] {row['filename']} "
                   f"{row['secs']:.1f}s | ETA {eta/60:.1f} min{flag}")
             if row.get('traceback'):
@@ -626,7 +700,7 @@ def main():
     rows.sort(key=lambda r: r['filename'])
 
     fields = ['filename', 'length_px', 'length_mm', 'euclid_px', 'euclid_mm',
-              'tip_x', 'tip_y', 'far_x', 'far_y', 'secs', 'status', 'error']
+              'tip_x', 'tip_y', 'far_x', 'far_y', 'secs', 'status', 'error',]
     
     with open(CSV_PATH, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fields)
